@@ -30,7 +30,9 @@ def main():
             ego_R = ego_pose['rotation']
             ego_T = ego_pose['translation']
             print(filename)
-            print(cam_front_data)
+            print("calib_sensor")
+            print(calib_sensor)
+            print("ego_pose")
             print(ego_pose)
             # print(f"{timestamp}, {filename}, {camera_intrinsic}, {ego_R}")
             current_sample = nusc.get('sample', current_sample['next'])
