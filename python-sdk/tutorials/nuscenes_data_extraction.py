@@ -34,10 +34,10 @@ def closest_timestep_interpolate(reference_array, interpolate_array):
     for ref_idx, entry in enumerate(reference_array):
         i_timestamp, i_value = entry
         i_timestamp = int(i_timestamp)
-        if i_timestamp < interpolate_array[interp_idx][0]:
-            print(f"skipping timestep {i_timestamp}")
-            reference_array = reference_array[ref_idx+1:]
-            continue
+        # if i_timestamp < interpolate_array[interp_idx][0]:
+        #     print(f"skipping timestep {i_timestamp}")
+        #     reference_array = reference_array[ref_idx+1:]
+        #     continue
         time_diff = np.abs(interpolate_array[:, 0] - i_timestamp)
         closest_match = np.argmin(time_diff)
         match_array.append(interpolate_array[closest_match])
@@ -54,12 +54,19 @@ def main():
     camera_data = {}
     nusc = NuScenes(version=VERSION, dataroot=DATA_DIR, verbose=True)
     nusc_can = NuScenesCanBus(dataroot=DATA_DIR)
+    blacklist = nusc_can.can_blacklist
     with h5py.File(os.path.join(save_path, f"{dataset_name}_combined.h5"), "w") as h5file:
-        for scene in nusc.scene:
+        for i_scene, scene in enumerate(nusc.scene):
             scene_name = scene['name']
             print("==================================")
-            print(f"processing scene {scene_name}, ")
+            print(f"processing {scene_name}, {i_scene} out of {len(nusc.scene)} scenes")
             print(f"{scene['description']}")
+
+            scene_number = int(scene['name'][-4:])
+            if scene_number in blacklist:
+                print("scene found in blacklist, skipping...")
+                continue
+
             scene_group = h5file.require_group(f"scene_{scene_name}")
             sample_tokens_list = []
             timestamps = []
