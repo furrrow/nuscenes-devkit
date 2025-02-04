@@ -2,10 +2,9 @@ from nuscenes.nuscenes import NuScenes
 from nuscenes.can_bus.can_bus_api import NuScenesCanBus
 import numpy as np
 import matplotlib.pyplot as plt
-import json
+from PIL import Image
 import os
 import h5py
-import cv2
 from tqdm import tqdm
 
 """
@@ -17,128 +16,148 @@ canbus documentation:
 https://github.com/nutonomy/nuscenes-devkit/blob/master/python-sdk/nuscenes/can_bus/README.md
 """
 
-def analyze_series(timed_array):
-    last_time = int(timed_array[-1])
-    first_time = int(timed_array[0])
-    print("duration of scene:")
-    print((last_time - first_time) / (1e6))
-    print("number of entries:")
-    print(len(timed_array))
-    # print("averaged time diff in miliseconds:")
-    # print((last_time - first_time) / len(timed_array))
-    print("total frequency:")  #  -> close enough to 100 hz!!
-    print(len(timed_array) / (last_time - first_time) * (1e6))
+def append_to_dataset(scene_group, dataset_name, data):
+    dataset = scene_group[dataset_name]
+    dataset.resize((dataset.shape[0] + 1), axis=0)
+    dataset[-1] = data
 
-def closest_timestep_interpolate(reference_times, interpolate_array):
-    match_array = []
-    for i_timestamp in reference_times:
-        i_timestamp = int(i_timestamp)
-        time_diff = np.abs(interpolate_array[:, 0] - i_timestamp)
-        closest_match = np.argmin(time_diff)
-        match_array.append(interpolate_array[closest_match])
-    return np.array(match_array)
+def save_h5(VERSION, generator, save_path):
+    save_file_name = f"nuscenes_{VERSION}_combined.h5"
+    with h5py.File(os.path.join(save_path, save_file_name), "w") as h5file:
 
-def save_h5(generator, h5_path, dataset_name="nuscenes"):
-    with h5py.File(os.path.join(h5_path, f"{dataset_name}_combined.h5"), "w") as h5file:
+        last_scene = None
+        scene_group = None
 
+        for img_paths, velocity, rotation_rate, acceleration, position, orientation, scene in generator:
 
-        for images, imu, scene in tqdm(generator):
+            # If a new scene starts, create a new scene group
+            if last_scene != scene:
+                scene_group = h5file.require_group(f"scene_{scene}")
+                last_scene = scene
 
-            # Create or get the scene group
-            scene_group = h5file.require_group(f"scene_{scene}")
+                # Create resizable datasets
+                scene_group.create_dataset("image_paths", shape=(0, 6), maxshape=(None, 6), dtype=h5py.string_dtype())
+                scene_group.create_dataset("velocity", shape=(0, 3), maxshape=(None, 3), dtype=np.float32)
+                scene_group.create_dataset("rotation_rate", shape=(0, 3), maxshape=(None, 3), dtype=np.float32)
+                scene_group.create_dataset("acceleration", shape=(0, 3), maxshape=(None, 3), dtype=np.float32)
+                scene_group.create_dataset("position", shape=(0, 3), maxshape=(None, 3), dtype=np.float32)
+                scene_group.create_dataset("orientation", shape=(0, 4), maxshape=(None, 4), dtype=np.float32)
 
-            # Create a new pair within the scene group
-            pair_idx = len(scene_group)  # Count existing pairs to assign a unique name
-            pair_group = scene_group.create_group(f"pair_{pair_idx}")
+            # Save image paths as strings instead of actual images
+            img_paths = [p.encode("utf-8") for p in img_paths]  # Convert to bytes
+            append_to_dataset(scene_group, "image_paths", img_paths)
+            append_to_dataset(scene_group, "velocity", velocity)
+            append_to_dataset(scene_group, "rotation_rate", rotation_rate)
+            append_to_dataset(scene_group, "acceleration", acceleration)
+            append_to_dataset(scene_group, "position", position)
+            append_to_dataset(scene_group, "orientation", orientation)
 
-            # Save the image as a dataset
-            pair_group.create_dataset("image", data=images, dtype=np.uint8)
+    print(f"{save_file_name} creation complete!")
 
-            # Save the IMU data as a dataset
-            pair_group.create_dataset("imu", data=np.array(imu, dtype=float))
+def nuscenes_data_generator(VERSION, DATA_DIR, camera_sensors, verbose=False):
+    """
+    generator function for the nuscenes dataset
+    Args:
+        :param VERSION: nuscenes data version, eg: 'v1.0-mini'; 'v1.0-trainval'
+        :param DATA_DIR: data root directory of the nuscenes dataset
+        :param camera_sensors: list of sensors in nuscenes, currently only support list of cameras
+        :param verbose: print/show images
 
-    print("HDF5 file creation complete!")
+    Returns:
+        img_paths,
+        velocity,
+        rotation_rate,
+        acceleration,
+        position,
+        orientation,
+        scene_number
 
-def nuscenes_data_generator(VERSION, DATA_DIR, sensors, save_path, dataset_name="nuscenes"):
-    calibration_data = {}
-    nusc = NuScenes(version=VERSION, dataroot=DATA_DIR, verbose=True)
+    """
+    nusc = NuScenes(version=VERSION, dataroot=DATA_DIR, verbose=verbose)
     nusc_can = NuScenesCanBus(dataroot=DATA_DIR)
     blacklist = nusc_can.can_blacklist
-    for i_scene, scene in enumerate(nusc.scene):
-        scene_name = scene['name']
-        print("==================================")
-        print(f"processing {scene_name}, {i_scene} out of {len(nusc.scene)} scenes")
-        print(f"{scene['description']}")
+    for i_scene, scene in tqdm(enumerate(nusc.scene), total=len(nusc.scene), disable=verbose):
 
         scene_number = int(scene['name'][-4:])
         if scene_number in blacklist:
             print("scene found in blacklist, skipping...")
             continue
 
-        timestamps = []
-        files_list = []
-        camera_intrinsic_dict = {}
-        current_sample = nusc.get('sample', scene['first_sample_token'])
-        for sensor_name in sensors:
-            sensor_files = []
-            sensor_data = nusc.get('sample_data', current_sample['data'][sensor_name])
-            calib_sensor = nusc.get('calibrated_sensor', sensor_data['calibrated_sensor_token'])
-            camera_intrinsic = calib_sensor['camera_intrinsic']
-            camera_intrinsic_dict[sensor_name] = camera_intrinsic
-            while not sensor_data['next'] == "":
-                if sensor_name == 'CAM_FRONT':
-                    timestamps.append(sensor_data['timestamp'])
-                filename = sensor_data['filename']
-                sensor_files.append(filename)
-                sensor_data = nusc.get('sample_data', sensor_data['next'])
-            files_list.append(sensor_files)
-        calibration_data[scene_name] = camera_intrinsic_dict
-        timestamps = np.array(timestamps)
+        scene_name = scene['name']
 
-        # look at extracted image time freq
-        # analyze_series(timestamps)
+        if verbose:
+            print("==================================")
+            print(f"processing {scene_name}, {i_scene + 1} out of {len(nusc.scene)} scenes")
+            print(f"description: {scene['description']}")
 
-        # get imu and velocities
-        # ms_imu = nusc_can.get_messages(scene_name, 'ms_imu') # 100hz
-        # ms_imu_a_r = np.array([(m['utime'], m['linear_accel'][0], m['linear_accel'][1], m['linear_accel'][2],
-        #                         m['rotation_rate'][0], m['rotation_rate'][1], m['rotation_rate'][2])
-        #                        for m in ms_imu])
-        # steer angle feedback, 100hz, Steering angle feedback in radians in range [-7.7, 6.3].
-        # 0 indicates no steering, positive values indicate left turns, negative values right turns.
-        angle = nusc_can.get_messages(scene_name, 'steeranglefeedback')
-        angle = np.array([(m['utime'], m['value']) for m in angle])
+        camera_tokens = {
+            cam: nusc.get('sample_data', nusc.get('sample', scene['first_sample_token'])['data'][cam])['token']
+            for cam in camera_sensors
+        }
 
-        # pose Info, 50hz
-        pose_info = nusc_can.get_messages(scene_name, 'pose')
-        # pose_speed = np.array([(m['utime'], m['vel']) for m in pose_info])
-        pose_array = np.array([(m['utime'], m['pos'], np.linalg.norm(m['vel']), m['accel'], m['rotation_rate']) for m in pose_info])
+        # Load CAN bus pose data
+        pose_data = nusc_can.get_messages(scene['name'], 'pose')
+        img_paths = []
 
-        updated_angle = closest_timestep_interpolate(reference_times=timestamps, interpolate_array=angle)
-        updated_pose = closest_timestep_interpolate(reference_times=timestamps, interpolate_array=pose_array)
-        print(f"lengths of combined files")
-        # print(len(updated_files), len(updated_angle), len(updated_speed), len(updated_imu))
-        print(len(updated_pose))
+        while all(camera_tokens.values()):
 
-        updated_speed = updated_pose[:, 2]
-        x_vel = np.cos(updated_angle[:, 1]) * updated_speed
-        y_vel = -np.sin(updated_angle[:, 1]) * updated_speed
-        z_vel = np.zeros_like(updated_angle[:, 1])
-        # print(f"saving scene {scene_name}...")
-        for i in range(len(files_list)):
-            img_paths = [os.path.join(DATA_DIR, img_loc) for img_loc in files_list[i]]
-            images = [cv2.imread(img_path) for img_path in img_paths]
-            pos = updated_pose[i][1]
-            accel = updated_pose[i][3]
-            rot_rate = updated_pose[i][4]
-            output_list = list(pos) + [x_vel[i], y_vel[i], z_vel[i]] + list(accel) + list(rot_rate)
-            yield images, output_list, scene_name
+            if verbose:
+                fig, axs = plt.subplots(2, 3, figsize=(15, 10))
 
-    # saving camera intrinsics data
-    json_object = json.dumps(calibration_data, indent=4)
-    print(f"saving calibration data in {dataset_name}_camera_data.json")
-    json_file_path = os.path.join(save_path, f"{dataset_name}_camera_data.json")
-    with open(json_file_path, "w") as outfile:
-        outfile.write(json_object)
+            for i, cam in enumerate(camera_sensors):
+                cam_token = camera_tokens[cam]
+
+                cam_data = nusc.get('sample_data', cam_token)
+
+                if verbose:
+                    print(f"{cam} Timestamp: {cam_data['timestamp']}")
+
+                cam_path = cam_data['filename']
+
+                # Load image
+                img_paths.append(cam_path)
+
+                if verbose:
+                    # Display image
+                    full_cam_path = os.path.join(DATA_DIR, cam_path)
+                    img = Image.open(full_cam_path)
+                    row, col = divmod(i, 3)
+                    axs[row, col].imshow(img)
+                    axs[row, col].set_title(f"{cam}")
+                    axs[row, col].axis('off')
+
+                # If CAM_FRONT, get the closest pose data
+                if cam == 'CAM_FRONT' and pose_data:
+                    closest_pose = min(pose_data, key=lambda x: abs(x['utime'] - cam_data['timestamp']))
+
+                    # Extract pose information
+                    acceleration = np.array(closest_pose['accel'])
+                    orientation = np.array(closest_pose['orientation'])
+                    position = np.array(closest_pose['pos'])
+                    rotation_rate = np.array(closest_pose['rotation_rate'])
+                    velocity = np.array(closest_pose['vel'])
+
+                    if verbose:
+                        print("\n--- Closest Pose Data ---")
+                        print(f"Timestamp: {closest_pose['utime']}")
+                        print(f"Acceleration (m/s²): {acceleration}")
+                        print(f"Orientation (quaternion): {orientation}")
+                        print(f"Position (x, y, z in meters): {position}")
+                        print(f"Rotation Rate (rad/s): {rotation_rate}")
+                        print(f"Velocity (m/s): {velocity}")
+
+                        print(cam_data)
+                if cam_data['next']:
+                    camera_tokens[cam] = cam_data['next']
+                else:
+                    camera_tokens[cam] = None
+
+            if verbose:
+                print("\n")
+                plt.show()
+            img_paths = np.array(img_paths)
+            yield img_paths, velocity, rotation_rate, acceleration, position, orientation, scene_number
+            img_paths = []
 
 def main():
     VERSION = 'v1.0-mini'
@@ -147,9 +166,8 @@ def main():
     save_path = "/home/jim/Documents/Projects/nuscenes-devkit"
     sensors = ['CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_FRONT_LEFT',
                'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT']
-    save_name = "nuscenes_test"
-    generator = nuscenes_data_generator(VERSION, DATA_DIR, sensors, save_path, save_name)
-    save_h5(generator, save_path, save_name)
+    generator = nuscenes_data_generator(VERSION, DATA_DIR, sensors, verbose=False)
+    save_h5(VERSION, generator, save_path)
 
 if __name__ == "__main__":
     main()
